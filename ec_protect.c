@@ -146,6 +146,9 @@ static uint64_t ec_protect_sleep_until(struct ec_protect_private *priv, pthread_
 static void ec_protect_scrub_expired_writtens(struct ec_protect_private *priv, uint64_t current_time);
 static uint64_t ec_protect_get_time(void);
 static int ec_protect_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, void *arg);
+static int ec_protect_list_block_versions(struct s3backer_store *s3b, block_list_ver_func_t *callback, void *arg);
+static int ec_protect_print_snapshots(struct s3backer_store *s3b, void *prarg, printer_t *printer);
+static int ec_protect_write_snapshot(struct s3backer_store *s3b, time_t timestamp, char *buf, size_t bufsiz);
 static void ec_protect_dirty_callback(void *arg, void *value);
 static void ec_protect_free_one(void *arg, void *value);
 
@@ -191,6 +194,9 @@ ec_protect_create(struct ec_protect_conf *config, struct s3backer_store *inner)
     s3b->read_block_part = ec_protect_read_block_part;
     s3b->write_block_part = ec_protect_write_block_part;
     s3b->list_blocks = ec_protect_list_blocks;
+    s3b->list_block_versions = ec_protect_list_block_versions;
+    s3b->print_snapshots = ec_protect_print_snapshots;
+    s3b->write_snapshot = ec_protect_write_snapshot;
     s3b->flush = ec_protect_flush;
     s3b->destroy = ec_protect_destroy;
     if ((priv = calloc(1, sizeof(*priv))) == NULL) {
@@ -341,6 +347,32 @@ ec_protect_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, 
     s3b_hash_foreach(priv->hashtable, ec_protect_dirty_callback, &cbinfo);
     pthread_mutex_unlock(&priv->mutex);
     return 0;
+}
+
+static int
+ec_protect_list_block_versions(struct s3backer_store *const s3b, block_list_ver_func_t *callback, void *arg)
+{
+    struct ec_protect_private *const priv = s3b->data;
+
+    return (*priv->inner->list_block_versions)(priv->inner, callback, arg);
+}
+
+static int
+ec_protect_print_snapshots(struct s3backer_store *const s3b, void *prarg, printer_t *printer)
+{
+    struct ec_protect_private *const priv = s3b->data;
+
+    return (*priv->inner->print_snapshots)(priv->inner, prarg, printer);
+}
+
+static int
+ec_protect_write_snapshot(struct s3backer_store *const s3b, time_t timestamp, char *buf, size_t bufsiz)
+{
+    struct ec_protect_private *const priv = s3b->data;
+
+    /* TODO: add some flush action here */
+    
+    return (*priv->inner->write_snapshot)(priv->inner, timestamp, buf, bufsiz);
 }
 
 static int

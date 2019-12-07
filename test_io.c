@@ -59,6 +59,9 @@ static int test_io_write_block(struct s3backer_store *s3b, s3b_block_t block_num
 static int test_io_read_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, void *dest);
 static int test_io_write_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, const void *src);
 static int test_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, void *arg);
+static int test_io_list_block_versions(struct s3backer_store *s3b, block_list_ver_func_t *callback, void *arg);
+static int test_io_print_snapshots(struct s3backer_store *s3b, void *prarg, printer_t *printer);
+static int test_io_write_snapshot(struct s3backer_store *s3b, time_t timestamp, char *buf, size_t bufsiz);
 static int test_io_flush(struct s3backer_store *s3b);
 static void test_io_destroy(struct s3backer_store *s3b);
 
@@ -84,6 +87,9 @@ test_io_create(struct http_io_conf *config)
     s3b->read_block_part = test_io_read_block_part;
     s3b->write_block_part = test_io_write_block_part;
     s3b->list_blocks = test_io_list_blocks;
+    s3b->list_block_versions = test_io_list_block_versions;
+    s3b->print_snapshots = test_io_print_snapshots;
+    s3b->write_snapshot = test_io_write_snapshot;
     s3b->flush = test_io_flush;
     s3b->destroy = test_io_destroy;
     if ((priv = calloc(1, sizeof(*priv) + config->block_size)) == NULL) {
@@ -265,6 +271,8 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     u_char md5[MD5_DIGEST_LENGTH];
     char temp[PATH_MAX];
     char path[PATH_MAX];
+    char vpath[PATH_MAX];
+    char version_id[TESTIO_VERID_LEN + 1];
     MD5_CTX ctx;
     int total;
     int fd;
@@ -307,13 +315,26 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
         return EAGAIN;
     }
 
-    /* Generate path */
+    /* Generate paths */
+    snprintf(version_id, sizeof(version_id), "%08jx%08jx",
+             (uintmax_t)http_io_block_hash_prefix((s3b_block_t)time(NULL)),
+             (uintmax_t)http_io_block_hash_prefix(block_num + 1));
     http_io_format_block_hash(config, block_hash_buf, sizeof(block_hash_buf), block_num);
     snprintf(path, sizeof(path), "%s/%s%s%0*jx",
       config->bucket, config->prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
+    snprintf(vpath, sizeof(vpath), "%s/.%s.%s%s%0*jx",
+             config->bucket, version_id, config->prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
 
     /* Delete zero blocks */
     if (src == NULL) {
+        /* Create empty file as a 'delete marker' */
+        if (1) { /* TODO: add config option */
+            if (open(vpath, O_CREAT|O_WRONLY, 0600) == -1) {
+                r = errno;
+                (*config->log)(LOG_ERR, "can't create delete marker %s: %s", vpath, strerror(r));
+                return r;
+            }
+        }
         if (unlink(path) == -1 && errno != ENOENT) {
             r = errno;
             (*config->log)(LOG_ERR, "can't unlink %s: %s", path, strerror(r));
@@ -340,6 +361,16 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     }
     close(fd);
 
+    /* Hard link temporary file to version */
+    if (1) { /* TODO: add config option */
+        if (link(temp, vpath) == -1) {
+            r = errno;
+            (*config->log)(LOG_ERR, "can't hard link %s to %s: %s", temp, vpath, strerror(r));
+            (void)unlink(temp);
+            return r;
+        }
+    }
+    
     /* Rename file */
     if (rename(temp, path) == -1) {
         r = errno;
@@ -401,3 +432,122 @@ test_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, voi
     return 0;
 }
 
+static int
+test_io_list_block_versions(struct s3backer_store *s3b, block_list_ver_func_t *callback, void *arg)
+{
+    struct test_io_private *const priv = s3b->data;
+    struct http_io_conf *const config = priv->config;
+    struct s3_block_ver block_version;
+    struct dirent *dent;
+    struct stat sb;
+    DIR *dir;
+    char path[PATH_MAX];
+    char version_id[TESTIO_VERID_LEN + 1];
+    int r;
+
+    /* Open directory */
+    if ((dir = opendir(config->bucket)) == NULL)
+        return errno;
+
+    /* Scan directory */
+    while ((dent = readdir(dir)) != NULL) {
+        if (dent->d_name[0] != '.') continue;
+        if (strlen(dent->d_name) < (TESTIO_VERID_LEN + 3) || dent->d_name[TESTIO_VERID_LEN + 1] != '.') continue;
+        if (http_io_parse_block(config, dent->d_name + TESTIO_VERID_LEN + 2, &block_version.block_num) != 0) continue;
+
+        block_version.object_key = dent->d_name;
+        strncpy(version_id, dent->d_name + 1, TESTIO_VERID_LEN);
+        version_id[TESTIO_VERID_LEN] = '\0';
+        block_version.version_id = version_id;
+
+        snprintf(path, sizeof(path), "%s/%s", config->bucket, dent->d_name);
+        if (stat(path, &sb) == -1) return errno;
+        
+        block_version.last_modified = sb.st_mtimespec.tv_sec;
+        block_version.is_latest = (sb.st_nlink == 2);
+
+        if ((r = (*callback)(arg, block_version)) != 0) {
+            (*config->log)(LOG_ERR, "block version callback failed: %s", strerror(r));
+            return r;
+        }
+    }
+
+    /* Close directory */
+    closedir(dir);
+    
+    return 0;
+}
+
+static int
+test_io_print_snapshots(struct s3backer_store *s3b, void *prarg, printer_t *printer)
+{
+    struct test_io_private *const priv = s3b->data;
+    struct http_io_conf *const config = priv->config;
+    struct dirent *dent;
+    DIR *dir;
+    char path[PATH_MAX];
+    
+    (*printer)(prarg, "hello snapshots world\n");
+    
+    /* Open directory */
+    snprintf(path, sizeof(path), "%s/.snapshots", config->bucket); 
+    if ((dir = opendir(path)) == NULL) {
+        (*config->log)(LOG_WARNING, "unable to open snapshot directory");
+        return 1;
+    }
+
+    /* Scan directory */
+    while ((dent = readdir(dir)) != NULL) {
+        if (dent->d_name[0] == '.') continue;
+        (*printer)(prarg, dent->d_name);
+        (*printer)(prarg, "\n");
+    }
+
+    /* Close directory */
+    closedir(dir);
+
+    return 0;
+}
+
+static int
+test_io_write_snapshot(struct s3backer_store *s3b, time_t timestamp, char *buf, size_t bufsiz)
+{
+    struct test_io_private *const priv = s3b->data;
+    struct http_io_conf *const config = priv->config;
+    char path[PATH_MAX];
+    char filename[PATH_MAX];
+    int fd;
+    int r;
+
+    /* Try to open the snapshots directory; if not, try to create it */
+    snprintf(path, sizeof(path), "%s/.snapshots", config->bucket); 
+    if (opendir(path) == NULL) {
+        if (mkdir(path, 0700) != 0) {
+            r = errno;
+            (*config->log)(LOG_ERR, "unable to create snapshot directory: %s", strerror(r));
+            return r;
+        }
+    }
+
+    /* open snapshot file */
+    strftime(filename, sizeof(filename), "%Y-%m-%dT%H:%M:%S", gmtime(&timestamp));
+    snprintf(path, sizeof(path), "%s/.snapshots/%s", config->bucket, filename);
+    if ((fd = open(path, O_CREAT | O_WRONLY, 0600)) == -1) {
+        r = errno;
+        (*config->log)(LOG_ERR, "open %s: %s", path, strerror(r));
+        return r;
+    }
+
+    /* write snapshot file */
+    if (write(fd, buf, bufsiz) == -1) {
+        r = errno;
+        (*config->log)(LOG_ERR, "cannot write %s: %s", path, strerror(r));
+        close(fd);
+        return r;
+    }
+
+    /* close snapshot file */
+    close(fd);
+
+    return 0;
+}

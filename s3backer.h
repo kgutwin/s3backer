@@ -103,6 +103,17 @@
 typedef uint32_t    s3b_block_t;
 
 /*
+ * Block version structure type.
+ */
+typedef struct s3_block_ver {
+    s3b_block_t block_num;
+    char *object_key;
+    char *version_id;
+    time_t last_modified;
+    u_char is_latest;
+} s3b_block_ver_t;
+
+/*
  * How many hex digits we will use to print a block number.
  */
 #define S3B_BLOCK_NUM_DIGITS    ((int)(sizeof(s3b_block_t) * 2))
@@ -113,8 +124,15 @@ typedef void        log_func_t(int level, const char *fmt, ...) __attribute__ ((
 /* Block list callback function type */
 typedef void        block_list_func_t(void *arg, s3b_block_t block_num);
 
+/* Block version list callback function type */
+typedef int         block_list_ver_func_t(void *arg, s3b_block_ver_t block_ver);
+
 /* Block write cancel check function type */
 typedef int         check_cancel_t(void *arg, s3b_block_t block_num);
+
+/* Printer */
+typedef void        printer_t(void *prarg, const char *fmt, ...) __attribute__ ((__format__ (__printf__, 2, 3)));
+
 
 /* Backing store instance structure */
 struct s3backer_store {
@@ -230,6 +248,27 @@ struct s3backer_store {
      */
     int         (*list_blocks)(struct s3backer_store *s3b, block_list_func_t *callback, void *arg);
 
+    /*
+     * Enumerate all block versions.
+     *
+     * Returns zero on success or a (positive) errno value on error.
+     */
+    int         (*list_block_versions)(struct s3backer_store *s3b, block_list_ver_func_t *callback, void *arg);
+
+    /*
+     * Write all known snapshots via the provided printer.
+     *
+     * Returns zero on success or a (positive) errno value on error.
+     */
+    int         (*print_snapshots)(struct s3backer_store *s3b, void *prarg, printer_t *printer);
+
+    /*
+     * Write the specified snapshot to the data store.
+     *
+     * Returns zero on success or a (positive) errno value on error.
+     */
+    int         (*write_snapshot)(struct s3backer_store *s3b, time_t timestamp, char *buf, size_t bufsiz);
+    
     /*
      * Sync any dirty data to the underlying data store.
      */

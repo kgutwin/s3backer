@@ -122,7 +122,7 @@ s3b_hash_put(struct s3b_hash *hash, void *value)
     for (i = FIRST(hash, key); 1; i = NEXT(hash, i)) {
         void *const value2 = VALUE(hash, i);
 
-        if (EMPTY(value))
+        if (EMPTY(value2))
             break;
         if (KEY(value2) == key) {
             VALUE(hash, i) = value;         /* replace existing value having the same key with new value */

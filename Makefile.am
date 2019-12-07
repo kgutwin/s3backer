@@ -48,6 +48,7 @@ noinst_HEADERS=     s3backer.h \
 			http_io.h \
 			reset.h \
 			test_io.h \
+			snapshots.h \
 			s3b_config.h
 
 man_MANS=           s3backer.1
@@ -71,6 +72,7 @@ s3backer_SOURCES=   main.c \
 		    s3b_config.c \
 		    test_io.c \
 		    sslcompat.c \
+		    snapshots.c \
 		    gitrev.c
 
 tester_SOURCES=     tester.c \
@@ -85,6 +87,7 @@ tester_SOURCES=     tester.c \
 		    s3b_config.c \
 		    test_io.c \
 		    sslcompat.c \
+		    snapshots.c \
 		    gitrev.c
 
 AM_CFLAGS=          $(FUSE_CFLAGS)

@@ -39,7 +39,6 @@ struct s3b_config;
 struct s3backer_store;
 
 /* Function types */
-typedef void printer_t(void *prarg, const char *fmt, ...) __attribute__ ((__format__ (__printf__, 2, 3)));
 typedef void print_stats_t(void *prarg, printer_t *printer);
 typedef void clear_stats_t(void);
 

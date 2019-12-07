@@ -191,6 +191,9 @@ static int block_cache_write_block(struct s3backer_store *s3b, s3b_block_t block
 static int block_cache_read_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, void *dest);
 static int block_cache_write_block_part(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, const void *src);
 static int block_cache_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, void *arg);
+static int block_cache_list_block_versions(struct s3backer_store *s3b, block_list_ver_func_t *callback, void *arg);
+static int block_cache_print_snapshots(struct s3backer_store *s3b, void *prarg, printer_t *printer);
+static int block_cache_write_snapshot(struct s3backer_store *s3b, time_t timestamp, char *buf, size_t bufsiz);
 static int block_cache_flush(struct s3backer_store *s3b);
 static void block_cache_destroy(struct s3backer_store *s3b);
 
@@ -251,6 +254,9 @@ block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner
     s3b->read_block_part = block_cache_read_block_part;
     s3b->write_block_part = block_cache_write_block_part;
     s3b->list_blocks = block_cache_list_blocks;
+    s3b->list_block_versions = block_cache_list_block_versions;
+    s3b->print_snapshots = block_cache_print_snapshots;
+    s3b->write_snapshot = block_cache_write_snapshot;
     s3b->flush = block_cache_flush;
     s3b->destroy = block_cache_destroy;
 
@@ -442,6 +448,32 @@ block_cache_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int
 
     /* Done */
     return 0;
+}
+
+static int
+block_cache_list_block_versions(struct s3backer_store *const s3b, block_list_ver_func_t *callback, void *arg)
+{
+    struct block_cache_private *const priv = s3b->data;
+
+    return (*priv->inner->list_block_versions)(priv->inner, callback, arg);
+}
+
+static int
+block_cache_print_snapshots(struct s3backer_store *const s3b, void *prarg, printer_t *printer)
+{
+    struct block_cache_private *const priv = s3b->data;
+
+    return (*priv->inner->print_snapshots)(priv->inner, prarg, printer);
+}
+
+static int
+block_cache_write_snapshot(struct s3backer_store *const s3b, time_t timestamp, char *buf, size_t bufsiz)
+{
+    struct block_cache_private *const priv = s3b->data;
+
+    /* TODO: add some flush action here */
+    
+    return (*priv->inner->write_snapshot)(priv->inner, timestamp, buf, bufsiz);
 }
 
 static int

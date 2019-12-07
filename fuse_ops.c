@@ -40,6 +40,7 @@
 #include "fuse_ops.h"
 #include "http_io.h"
 #include "s3b_config.h"
+#include "snapshots.h"
 
 /****************************************************************************
  *                              DEFINITIONS                                 *
@@ -49,23 +50,35 @@
 #define FILE_INODE      2
 #define STATS_INODE     3
 
-/* Represents an open 'stats' file */
-struct stat_file {
-    char    *buf;           // note: not necessarily nul-terminated
-    size_t  len;            // length of string in 'buf'
-    size_t  bufsiz;         // size allocated for 'buf'
-    int     memerr;         // we got a memory error
+#define VFILES_MAX      2
+
+/* Represents an open 'stats' type file */
+struct virtual_file_entry {
+    const char  *filename;
+    ino_t       inode;
+    time_t      atime;
+    void        (*writer)(void*, printer_t*);
+    void        (*parser)(const char*, size_t);
+    int         (*unlinker)(void);
+};
+
+struct virtual_file {
+    struct virtual_file_entry  *vf_entry;
+    char                       *buf;           // note: not necessarily nul-terminated
+    size_t                     len;            // length of string in 'buf'
+    size_t                     bufsiz;         // size allocated for 'buf'
+    int                        memerr;         // we got a memory error
 };
 
 /* Private information */
 struct fuse_ops_private {
-    struct s3backer_store   *s3b;
-    u_int                   block_bits;
-    off_t                   file_size;
-    time_t                  start_time;
-    time_t                  file_atime;
-    time_t                  file_mtime;
-    time_t                  stats_atime;
+    struct s3backer_store     *s3b;
+    u_int                     block_bits;
+    off_t                     file_size;
+    time_t                    start_time;
+    time_t                    file_atime;
+    time_t                    file_mtime;
+    struct virtual_file_entry vfiles[VFILES_MAX];
 };
 
 /****************************************************************************
@@ -96,12 +109,17 @@ static int fuse_op_fallocate(const char *path, int mode, off_t offset, off_t len
 
 /* Attribute functions */
 static void fuse_op_getattr_file(struct fuse_ops_private *priv, struct stat *st);
-static void fuse_op_getattr_stats(struct fuse_ops_private *priv, struct stat_file *sfile, struct stat *st);
+static void fuse_op_getattr_virtual_file(struct fuse_ops_private *priv, struct virtual_file *vfile, struct stat *st);
 
-/* Stats functions */
-static struct stat_file *fuse_op_stats_create(struct fuse_ops_private *priv);
-static void fuse_op_stats_destroy(struct stat_file *sfile);
-static printer_t fuse_op_stats_printer;
+/* Virtual file functions */
+static struct virtual_file *fuse_op_virtual_file_create(struct fuse_ops_private *priv, struct virtual_file_entry *vf);
+static void fuse_op_virtual_file_destroy(struct virtual_file *vfile);
+static printer_t fuse_op_virtual_file_printer;
+
+static int fuse_op_stats_unlinker(void);
+static void fuse_op_snapshots_writer(void *prarg, printer_t *printer);
+static void fuse_op_snapshots_parser(const char *buf, size_t size);
+
 
 /****************************************************************************
  *                          VARIABLE DEFINITIONS                            *
@@ -151,11 +169,28 @@ fuse_ops_create(struct fuse_ops_conf *config0, struct s3backer_store *s3b)
 
     /* Create private structure */
     if ((the_priv = calloc(1, sizeof(*the_priv))) == NULL) {
-        (*config->log)(LOG_ERR, "fuse_ops_create(): %s", strerror(errno));
+        (*config0->log)(LOG_ERR, "fuse_ops_create(): %s", strerror(errno));
         return NULL;
     }
     the_priv->s3b = s3b;
 
+    /* Set up virtual files */
+    int vfe = 0;
+    if (config0->print_stats != NULL) {
+        the_priv->vfiles[vfe].filename = config0->stats_filename;
+        the_priv->vfiles[vfe].inode = STATS_INODE + vfe;
+        the_priv->vfiles[vfe].writer = config0->print_stats;
+        the_priv->vfiles[vfe].unlinker = fuse_op_stats_unlinker;
+        vfe++;
+    }
+    if (1) { /* TODO: add config option */
+        the_priv->vfiles[vfe].filename = "snapshots";
+        the_priv->vfiles[vfe].inode = STATS_INODE + vfe;
+        the_priv->vfiles[vfe].writer = fuse_op_snapshots_writer;
+        the_priv->vfiles[vfe].parser = fuse_op_snapshots_parser;
+        vfe++;
+    }
+    
     /* Now we're ready */
     config = config0;
     return &s3backer_fuse_ops;
@@ -181,7 +216,6 @@ fuse_op_init(struct fuse_conn_info *conn)
     priv->start_time = time(NULL);
     priv->file_atime = priv->start_time;
     priv->file_mtime = priv->start_time;
-    priv->stats_atime = priv->start_time;
     priv->file_size = config->num_blocks * config->block_size;
 
     /* Startup background threads now that we have fork()'d */
@@ -253,14 +287,18 @@ fuse_op_getattr(const char *path, struct stat *st)
         fuse_op_getattr_file(priv, st);
         return 0;
     }
-    if (*path == '/' && config->print_stats != NULL && strcmp(path + 1, config->stats_filename) == 0) {
-        struct stat_file *sfile;
+    if (*path == '/') {
+        for (int i = 0; i < VFILES_MAX; i++) {
+            if (strcmp(path + 1, priv->vfiles[i].filename) == 0) {
+                struct virtual_file *vfile;
 
-        if ((sfile = fuse_op_stats_create(priv)) == NULL)
-            return -ENOMEM;
-        fuse_op_getattr_stats(priv, sfile, st);
-        fuse_op_stats_destroy(sfile);
-        return 0;
+                if ((vfile = fuse_op_virtual_file_create(priv, &priv->vfiles[i])) == NULL)
+                    return -ENOMEM;
+                fuse_op_getattr_virtual_file(priv, vfile, st);
+                fuse_op_virtual_file_destroy(vfile);
+                return 0;
+            }
+        }
     }
     return -ENOENT;
 }
@@ -271,9 +309,9 @@ fuse_op_fgetattr(const char *path, struct stat *st, struct fuse_file_info *fi)
     struct fuse_ops_private *const priv = (struct fuse_ops_private *)fuse_get_context()->private_data;
 
     if (fi->fh != 0) {
-        struct stat_file *const sfile = (struct stat_file *)(uintptr_t)fi->fh;
+        struct virtual_file *const vfile = (struct virtual_file *)(uintptr_t)fi->fh;
 
-        fuse_op_getattr_stats(priv, sfile, st);
+        fuse_op_getattr_virtual_file(priv, vfile, st);
     } else
         fuse_op_getattr_file(priv, st);
     return 0;
@@ -296,17 +334,20 @@ fuse_op_getattr_file(struct fuse_ops_private *priv, struct stat *st)
 }
 
 static void
-fuse_op_getattr_stats(struct fuse_ops_private *priv, struct stat_file *sfile, struct stat *st)
+fuse_op_getattr_virtual_file(struct fuse_ops_private *priv, struct virtual_file *vfile, struct stat *st)
 {
     st->st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH;
+    if (vfile->vf_entry->parser != NULL) {
+        st->st_mode |= S_IWUSR;
+    }
     st->st_nlink = 1;
-    st->st_ino = STATS_INODE;
+    st->st_ino = vfile->vf_entry->inode;
     st->st_uid = config->uid;
     st->st_gid = config->gid;
-    st->st_size = sfile->len;
+    st->st_size = vfile->len;
     st->st_blksize = config->block_size;
     st->st_blocks = 0;
-    st->st_atime = priv->stats_atime;
+    st->st_atime = vfile->vf_entry->atime;
     st->st_mtime = time(NULL);
     st->st_ctime = priv->start_time;
 }
@@ -328,8 +369,9 @@ fuse_op_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     if (priv != NULL) {
         if (filler(buf, config->filename, NULL, 0) != 0)
             return -ENOMEM;
-        if (config->print_stats != NULL && config->stats_filename != NULL) {
-            if (filler(buf, config->stats_filename, NULL, 0) != 0)
+        for (int i = 0; i < VFILES_MAX; i++) {
+            if (priv->vfiles[i].filename == NULL) continue;
+            if (filler(buf, priv->vfiles[i].filename, NULL, 0) != 0)
                 return -ENOMEM;
         }
     }
@@ -355,15 +397,18 @@ fuse_op_open(const char *path, struct fuse_file_info *fi)
     }
 
     /* Stats file */
-    if (*path == '/' && config->print_stats != NULL && strcmp(path + 1, config->stats_filename) == 0) {
-        struct stat_file *sfile;
+    if (*path == '/') {
+        for (int i = 0; i < VFILES_MAX; i++) {
+            if (strcmp(path + 1, priv->vfiles[i].filename) == 0) {
+                struct virtual_file *vfile;
 
-        if ((sfile = fuse_op_stats_create(priv)) == NULL)
-            return -ENOMEM;
-        fi->fh = (uint64_t)(uintptr_t)sfile;
-        priv->stats_atime = time(NULL);
-        fi->direct_io = 1;
-        return 0;
+                if ((vfile = fuse_op_virtual_file_create(priv, &priv->vfiles[i])) == NULL)
+                    return -ENOMEM;
+                fi->fh = (uint64_t)(uintptr_t)vfile;
+                fi->direct_io = 1;
+                return 0;
+            }
+        }
     }
 
     /* Unknown file */
@@ -374,9 +419,9 @@ static int
 fuse_op_release(const char *path, struct fuse_file_info *fi)
 {
     if (fi->fh != 0) {
-        struct stat_file *const sfile = (struct stat_file *)(uintptr_t)fi->fh;
+        struct virtual_file *const vfile = (struct virtual_file *)(uintptr_t)fi->fh;
 
-        fuse_op_stats_destroy(sfile);
+        fuse_op_virtual_file_destroy(vfile);
     }
     return 0;
 }
@@ -394,14 +439,14 @@ fuse_op_read(const char *path, char *buf, size_t size, off_t offset,
 
     /* Handle stats file */
     if (fi->fh != 0) {
-        struct stat_file *const sfile = (struct stat_file *)(uintptr_t)fi->fh;
+        struct virtual_file *const vfile = (struct virtual_file *)(uintptr_t)fi->fh;
 
-        if (offset > sfile->len)
+        if (offset > vfile->len)
             return 0;
-        if (offset + size > sfile->len)
-            size = sfile->len - offset;
-        memcpy(buf, sfile->buf + offset, size);
-        priv->stats_atime = time(NULL);
+        if (offset + size > vfile->len)
+            size = vfile->len - offset;
+        memcpy(buf, vfile->buf + offset, size);
+        vfile->vf_entry->atime = time(NULL);
         return size;
     }
 
@@ -469,8 +514,13 @@ static int fuse_op_write(const char *path, const char *buf, size_t size,
         return -EROFS;
 
     /* Handle stats file */
-    if (fi->fh != 0)
-        return -EINVAL;
+    if (fi->fh != 0) {
+        struct virtual_file *const vfile = (struct virtual_file *)(uintptr_t)fi->fh;
+
+        (*vfile->vf_entry->parser)(buf, size);
+        vfile->vf_entry->atime = time(NULL);
+        return orig_size;
+    }
 
     /* Check for end of file */
     if (offset > priv->file_size) {
@@ -533,7 +583,7 @@ fuse_op_statfs(const char *path, struct statvfs *st)
     st->f_blocks = config->num_blocks;
     st->f_bfree = 0;
     st->f_bavail = 0;
-    st->f_files = 3;
+    st->f_files = 3; /* TODO: fix */
     st->f_ffree = 0;
     st->f_favail = 0;
     return 0;
@@ -560,12 +610,16 @@ fuse_op_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
 static int
 fuse_op_unlink(const char *path)
 {
+    struct fuse_ops_private *const priv = (struct fuse_ops_private *)fuse_get_context()->private_data;
+
     /* Handle stats file */
-    if (*path == '/' && strcmp(path + 1, config->stats_filename) == 0) {
-        if (config->clear_stats == NULL)
-            return -EOPNOTSUPP;
-        (*config->clear_stats)();
-        return 0;
+    if (*path == '/') {
+        for (int i = 0; i < VFILES_MAX; i++) {
+            if (strcmp(path + 1, priv->vfiles[i].filename) == 0) {
+                if (priv->vfiles[i].unlinker != NULL)
+                    return (priv->vfiles[i].unlinker)();
+            }
+        }
     }
 
     /* Not supported */
@@ -656,32 +710,34 @@ fuse_op_fallocate(const char *path, int mode, off_t offset, off_t len, struct fu
  *                    OTHER INTERNAL FUNCTIONS                              *
  ****************************************************************************/
 
-static struct stat_file *
-fuse_op_stats_create(struct fuse_ops_private *priv)
+static struct virtual_file *
+fuse_op_virtual_file_create(struct fuse_ops_private *priv, struct virtual_file_entry *vf)
 {
-    struct stat_file *sfile;
+    struct virtual_file *vfile;
 
-    if ((sfile = calloc(1, sizeof(*sfile))) == NULL)
+    if ((vfile = calloc(1, sizeof(*vfile))) == NULL)
         return NULL;
-    (*config->print_stats)(sfile, fuse_op_stats_printer);
-    if (sfile->memerr != 0) {
-        fuse_op_stats_destroy(sfile);
+    vfile->vf_entry = vf;
+    (*vf->writer)(vfile, fuse_op_virtual_file_printer);
+    vf->atime = time(NULL);
+    if (vfile->memerr != 0) {
+        fuse_op_virtual_file_destroy(vfile);
         return NULL;
     }
-    return sfile;
+    return vfile;
 }
 
 static void
-fuse_op_stats_destroy(struct stat_file *sfile)
+fuse_op_virtual_file_destroy(struct virtual_file *vfile)
 {
-    free(sfile->buf);
-    free(sfile);
+    free(vfile->buf);
+    free(vfile);
 }
 
 static void
-fuse_op_stats_printer(void *prarg, const char *fmt, ...)
+fuse_op_virtual_file_printer(void *prarg, const char *fmt, ...)
 {
-    struct stat_file *const sfile = prarg;
+    struct virtual_file *const vfile = prarg;
     va_list args;
     char *new_buf;
     size_t new_bufsiz;
@@ -689,28 +745,57 @@ fuse_op_stats_printer(void *prarg, const char *fmt, ...)
     int added;
 
     /* Bail if no memory */
-    if (sfile->memerr)
+    if (vfile->memerr)
         return;
 
 again:
     /* Append to string buffer */
-    remain = sfile->bufsiz - sfile->len;
+    remain = vfile->bufsiz - vfile->len;
     va_start(args, fmt);
-    added = vsnprintf(sfile->buf + sfile->len, sfile->bufsiz - sfile->len, fmt, args);
+    added = vsnprintf(vfile->buf + vfile->len, vfile->bufsiz - vfile->len, fmt, args);
     va_end(args);
     if (added + 1 <= remain) {
-        sfile->len += added;
+        vfile->len += added;
         return;
     }
 
     /* We need a bigger buffer */
-    new_bufsiz = ((sfile->bufsiz + added + 1023) / 1024) * 1024;
-    if ((new_buf = realloc(sfile->buf, new_bufsiz)) == NULL) {
-        sfile->memerr = 1;
+    new_bufsiz = ((vfile->bufsiz + added + 1023) / 1024) * 1024;
+    if ((new_buf = realloc(vfile->buf, new_bufsiz)) == NULL) {
+        vfile->memerr = 1;
         return;
     }
-    sfile->buf = new_buf;
-    sfile->bufsiz = new_bufsiz;
+    vfile->buf = new_buf;
+    vfile->bufsiz = new_bufsiz;
     goto again;
 }
 
+static int
+fuse_op_stats_unlinker(void)
+{
+    if (config->clear_stats == NULL)
+        return -EOPNOTSUPP;
+
+    (*config->clear_stats)();
+    return 0;
+}
+
+static void
+fuse_op_snapshots_writer(void *prarg, printer_t *printer)
+{
+    struct fuse_ops_private *const priv = (struct fuse_ops_private *)fuse_get_context()->private_data;
+
+    (*priv->s3b->print_snapshots)(priv->s3b, prarg, printer);
+}
+
+static void
+fuse_op_snapshots_parser(const char *buf, size_t size)
+{
+    struct fuse_ops_private *const priv = (struct fuse_ops_private *)fuse_get_context()->private_data;
+    char first[128];
+
+    strncpy(first, buf, (size < 127 ? size : 127));
+    (*config->log)(LOG_DEBUG, "snapshots: (%d) %s", size, first);
+
+    snapshots_create(priv->s3b, config->num_blocks, 0);
+}

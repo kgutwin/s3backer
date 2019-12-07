@@ -34,6 +34,8 @@
  * also delete it here.
  */
 
+#define TESTIO_VERID_LEN 16
+
 /* test_io.c */
 extern struct s3backer_store *test_io_create(struct http_io_conf *config);
 

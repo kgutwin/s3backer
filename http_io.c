@@ -281,7 +281,6 @@ static void http_io_authsig(struct http_io_private *priv, s3b_block_t block_num,
 static void update_hmac_from_header(HMAC_CTX *ctx, struct http_io *io,
   const char *name, int value_only, char *sigbuf, size_t sigbuflen);
 static int http_io_is_zero_block(const void *data, u_int block_size);
-static s3b_block_t http_io_block_hash_prefix(s3b_block_t block_num);
 static int http_io_parse_hex(const char *str, u_char *buf, u_int nbytes);
 static int http_io_parse_hex_block_num(const char *string, s3b_block_t *block_nump);
 static void http_io_prhex(char *buf, const u_char *data, size_t len);
@@ -726,7 +725,8 @@ http_io_list_elem_end(void *arg, const XML_Char *name)
 #endif
             (*io->callback_func)(io->callback_arg, block_num);
             io->last_block = block_num;
-        } else {                                                        /* object is some unrelated junk that we can ignore */
+        } else {
+            /* object is some unrelated junk that we can ignore */
             char last_block_path[strlen(config->prefix) + S3B_BLOCK_NUM_DIGITS + 1];
 
 #if DEBUG_BLOCK_LIST
