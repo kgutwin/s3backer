@@ -86,6 +86,8 @@ struct http_io_conf {
     uintmax_t           max_speed[2];
     log_func_t          *log;
     const char          *sse;
+    int                 snapshots;
+    const char          *snapshot_mount_name;
 };
 
 /* Statistics structure for http_io store */

@@ -14,6 +14,12 @@
  * - backer should disable writes when snapshot is mounted
  */
 
+/*
+ * - add commandline / config option
+ * - flush cache before taking snapshot
+ * - parse snapshot timestamp
+ */
+
 
 static int snapshots_create_block_ver(void *arg, s3b_block_ver_t block_ver);
 static void snapshots_release_block_ver(void *arg, void *entry);

@@ -161,6 +161,8 @@ static struct s3b_config config = {
         .timeout=               S3BACKER_DEFAULT_TIMEOUT,
         .initial_retry_pause=   S3BACKER_DEFAULT_INITIAL_RETRY_PAUSE,
         .max_retry_pause=       S3BACKER_DEFAULT_MAX_RETRY_PAUSE,
+        .snapshots=             0,
+        .snapshot_mount_name=   NULL,
     },
 
     /* "Eventual consistency" protection config */
@@ -186,6 +188,7 @@ static struct s3b_config config = {
         .filename=              S3BACKER_DEFAULT_FILENAME,
         .stats_filename=        S3BACKER_DEFAULT_STATS_FILENAME,
         .file_mode=             -1,             /* default depends on 'read_only' */
+        .snapshots=             0,
     },
 
     /* Common stuff */
@@ -435,6 +438,15 @@ static const struct fuse_opt option_list[] = {
     {
         .templ=     "--compress=%d",
         .offset=    offsetof(struct s3b_config, http_io.compress),
+    },
+    {
+        .templ=     "--snapshots",
+        .offset=    offsetof(struct s3b_config, http_io.snapshots),
+        .value=     1
+    },
+    {
+        .templ=     "--snapshotMount=%s",
+        .offset=    offsetof(struct s3b_config, http_io.snapshot_mount_name),
     },
     {
         .templ=     "--encrypt",
@@ -975,6 +987,16 @@ validate_config(void)
         }
     }
 
+    /* Validate snapshots and mounts */
+    if (config.http_io.snapshot_mount_name != NULL) {
+        config.fuse_ops.read_only = 1;
+        config.http_io.snapshots = 1;
+        warnx("Mounting snapshot `%s' read-only", config.http_io.snapshot_mount_name);
+    }
+    if (config.http_io.snapshots == 1) {
+        config.fuse_ops.snapshots = 1;
+    }
+    
     /* Auto-set file mode in read_only if not explicitly set */
     if (config.fuse_ops.file_mode == -1) {
         config.fuse_ops.file_mode = config.fuse_ops.read_only ?

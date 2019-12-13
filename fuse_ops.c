@@ -183,7 +183,7 @@ fuse_ops_create(struct fuse_ops_conf *config0, struct s3backer_store *s3b)
         the_priv->vfiles[vfe].unlinker = fuse_op_stats_unlinker;
         vfe++;
     }
-    if (1) { /* TODO: add config option */
+    if (config0->snapshots) {
         the_priv->vfiles[vfe].filename = "snapshots";
         the_priv->vfiles[vfe].inode = STATS_INODE + vfe;
         the_priv->vfiles[vfe].writer = fuse_op_snapshots_writer;

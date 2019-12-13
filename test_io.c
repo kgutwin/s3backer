@@ -38,6 +38,7 @@
 #include "http_io.h"
 #include "block_part.h"
 #include "test_io.h"
+#include "snapshots.h"
 
 /* Do we want random errors? */
 #define RANDOM_ERROR_PERCENT    0
@@ -46,6 +47,7 @@
 struct test_io_private {
     struct http_io_conf         *config;
     u_char                      zero_block[0];
+    struct snapshot_data        *snapshot;
 };
 
 /* s3backer_store functions */
@@ -75,10 +77,14 @@ test_io_create(struct http_io_conf *config)
 {
     struct s3backer_store *s3b;
     struct test_io_private *priv;
+    int r;
 
     /* Initialize structures */
-    if ((s3b = calloc(1, sizeof(*s3b))) == NULL)
-        return NULL;
+    if ((s3b = calloc(1, sizeof(*s3b))) == NULL) {
+        r = errno;
+        goto fail0;
+    }
+
     s3b->create_threads = test_io_create_threads;
     s3b->meta_data = test_io_meta_data;
     s3b->set_mount_token = test_io_set_mount_token;
@@ -93,18 +99,40 @@ test_io_create(struct http_io_conf *config)
     s3b->flush = test_io_flush;
     s3b->destroy = test_io_destroy;
     if ((priv = calloc(1, sizeof(*priv) + config->block_size)) == NULL) {
-        free(s3b);
-        errno = ENOMEM;
-        return NULL;
+        r = errno;
+        goto fail1;
     }
     priv->config = config;
     s3b->data = priv;
 
+    /* load snapshot if specified */
+    if (config->snapshot_mount_name != NULL) {
+        char path[PATH_MAX];
+        int fd;
+
+        snprintf(path, sizeof(path), "%s/.snapshots/%s", config->bucket, config->snapshot_mount_name);
+        if ((fd = open(path, O_RDONLY)) == -1) {
+            r = errno;
+            (*config->log)(LOG_ERR, "open snapshot %s: %s", path, strerror(r));
+            goto fail2;
+        }
+        // determine size of snapshot file, read entire contents and pass on
+        priv->snapshot = snapshots_read(buf, size, timestamp);
+    }
+    
     /* Random initialization */
     srandom((u_int)time(NULL));
 
     /* Done */
     return s3b;
+
+ fail2:
+    free(priv);
+ fail1:
+    free(s3b);
+ fail0:
+    errno = r;
+    return NULL;
 }
 
 static int
@@ -328,7 +356,7 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     /* Delete zero blocks */
     if (src == NULL) {
         /* Create empty file as a 'delete marker' */
-        if (1) { /* TODO: add config option */
+        if (config->snapshots) {
             if (open(vpath, O_CREAT|O_WRONLY, 0600) == -1) {
                 r = errno;
                 (*config->log)(LOG_ERR, "can't create delete marker %s: %s", vpath, strerror(r));
@@ -362,7 +390,7 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     close(fd);
 
     /* Hard link temporary file to version */
-    if (1) { /* TODO: add config option */
+    if (config->snapshots) {
         if (link(temp, vpath) == -1) {
             r = errno;
             (*config->log)(LOG_ERR, "can't hard link %s to %s: %s", temp, vpath, strerror(r));

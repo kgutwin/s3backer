@@ -57,6 +57,7 @@ struct fuse_ops_conf {
     off_t                   num_blocks;
     int                     file_mode;
     log_func_t              *log;
+    int                     snapshots;
 };
 
 /* fuse_ops.c */
